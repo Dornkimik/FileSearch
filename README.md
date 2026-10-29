@@ -21,6 +21,7 @@ It searches **names and paths only**. It never reads file contents.
   - **Aa** turns on case-sensitive matching. **Path** matches against the full path instead of only the name (`projects\notes .md`).
 - **Filters**: files or folders, categories (Documents, Images, Audio, Video, Archives, Code, Programs), custom extensions, size range, modified date and location (folder).
 - **Less clutter.** System files are hidden by default: anything in Windows, Program Files, ProgramData or AppData, plus items Windows marks as system files. Hidden items are also off by default. Each has its own checkbox in the sidebar.
+- **Exclude folders**: right-click any result and use **Exclude folder ▸** to pick that folder or any folder above it. Excluded folders are listed in the sidebar, where ✕ removes one, and they are remembered between launches.
 - **Results**: sortable columns (Name, Folder, Size, Modified), a right-click menu (Open, Show in Explorer, Copy path, Copy name), and light and dark themes.
 
 ## Keyboard

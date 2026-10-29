@@ -10,7 +10,7 @@ use eframe::egui::{
 use egui_extras::{Column, TableBuilder};
 
 use crate::icons;
-use crate::index::{self, Shared};
+use crate::index::{self, NONE, Shared};
 use crate::search::{CATEGORIES, DatePreset, Filters, Kind, Mode, Request, Searcher, SizeUnit, Sort, SortKey};
 use crate::theme::{self, Palette};
 use crate::util;
@@ -21,6 +21,7 @@ enum Action {
     Open(String),
     Reveal(String),
     Copy(String),
+    Exclude(String),
 }
 
 pub struct App {
@@ -63,7 +64,7 @@ impl App {
             shared,
             searcher,
             drives,
-            filters: Filters::default(),
+            filters: Filters { excluded: load_excluded(), ..Filters::default() },
             sort: Sort { key: SortKey::Name, ascending: true },
             sent: None,
             next_id: 0,
@@ -325,12 +326,32 @@ impl App {
             );
             ui.checkbox(&mut f.include_hidden, "Include hidden items");
 
+            if !f.excluded.is_empty() {
+                section(ui, p, "EXCLUDED FOLDERS");
+                let mut remove = None;
+                for (i, path) in f.excluded.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        let (r, resp) = ui.allocate_exact_size(vec2(22.0, 22.0), Sense::click());
+                        icons::close(ui.painter(), r, if resp.hovered() { p.error } else { p.muted });
+                        if resp.on_hover_cursor(CursorIcon::PointingHand).on_hover_text("Stop excluding").clicked() {
+                            remove = Some(i);
+                        }
+                        ui.add(Label::new(RichText::new(path).color(p.text)).truncate());
+                    });
+                }
+                if let Some(i) = remove {
+                    f.excluded.remove(i);
+                    save_excluded(&f.excluded);
+                }
+            }
+
             if f.active_count() > 0 || f.include_hidden || f.include_system {
                 ui.add_space(14.0);
                 if ui.add(Button::new("Reset filters").min_size(vec2(full, 30.0))).clicked() {
-                    let keep = (f.text.clone(), f.mode, f.case_sensitive, f.match_path);
+                    // Exclusions are a lasting preference, so a reset keeps them.
+                    let keep = (f.text.clone(), f.mode, f.case_sensitive, f.match_path, std::mem::take(&mut f.excluded));
                     *f = Filters::default();
-                    (f.text, f.mode, f.case_sensitive, f.match_path) = keep;
+                    (f.text, f.mode, f.case_sensitive, f.match_path, f.excluded) = keep;
                 }
             }
 
@@ -464,6 +485,22 @@ impl App {
                         if ui.button("Copy name").clicked() {
                             action = Some(Action::Copy(name.to_string()));
                         }
+                        ui.separator();
+                        ui.menu_button("Exclude folder", |ui| {
+                            ui.set_min_width(200.0);
+                            // The folder itself (for folders), then each ancestor up to the drive.
+                            if e.is_dir() && ui.button(short(name)).on_hover_text(idx.full_path(e)).clicked() {
+                                action = Some(Action::Exclude(idx.full_path(e)));
+                            }
+                            let mut d = e.parent;
+                            while d != NONE && idx.dirs[d as usize].parent != NONE {
+                                let path = idx.dir_path(d);
+                                if ui.button(short(idx.dir_name(d, false))).on_hover_text(&path).clicked() {
+                                    action = Some(Action::Exclude(path));
+                                }
+                                d = idx.dirs[d as usize].parent;
+                            }
+                        });
                     });
                 });
             });
@@ -562,6 +599,12 @@ impl eframe::App for App {
             Some(Action::Open(path)) => util::open(&path),
             Some(Action::Reveal(path)) => util::reveal(&path),
             Some(Action::Copy(text)) => ctx.copy_text(text),
+            Some(Action::Exclude(path)) => {
+                if !self.filters.excluded.iter().any(|p| p.eq_ignore_ascii_case(&path)) {
+                    self.filters.excluded.push(path);
+                    save_excluded(&self.filters.excluded);
+                }
+            }
             None => {}
         }
 
@@ -662,6 +705,35 @@ fn sort_header(ui: &mut Ui, p: &Palette, sort: &mut Sort, key: SortKey, label: &
             // Names read best A→Z; sizes and dates are most useful largest/newest first.
             *sort = Sort { key, ascending: matches!(key, SortKey::Name | SortKey::Folder) };
         }
+    }
+}
+
+/// Shortens a folder name for a menu label.
+fn short(name: &str) -> String {
+    if name.chars().count() <= 32 {
+        return name.to_string();
+    }
+    let head: String = name.chars().take(31).collect();
+    format!("{head}…")
+}
+
+fn excluded_path() -> Option<PathBuf> {
+    index::cache_path().map(|p| p.with_file_name("excluded.txt"))
+}
+
+fn load_excluded() -> Vec<String> {
+    let Some(text) = excluded_path().and_then(|p| std::fs::read_to_string(p).ok()) else {
+        return Vec::new();
+    };
+    text.lines().map(str::trim).filter(|l| !l.is_empty()).map(String::from).collect()
+}
+
+fn save_excluded(paths: &[String]) {
+    if let Some(file) = excluded_path() {
+        if let Some(dir) = file.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(file, paths.join("\n"));
     }
 }
 

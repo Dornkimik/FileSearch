@@ -150,6 +150,8 @@ pub struct Filters {
     pub location: String,
     pub include_hidden: bool,
     pub include_system: bool,
+    /// Folders whose contents (and the folder itself) never appear in results.
+    pub excluded: Vec<String>,
 }
 
 impl Filters {
@@ -213,6 +215,10 @@ struct Compiled {
     location: Option<Vec<bool>>,
     include_hidden: bool,
     include_system: bool,
+    /// Per directory: whether it lies inside an excluded folder.
+    excluded_dirs: Option<Vec<bool>>,
+    /// The entries of the excluded folders themselves.
+    excluded_entries: HashSet<u32>,
 }
 
 fn parse_size(s: &str, unit: SizeUnit, which: &str) -> Result<Option<u64>, String> {
@@ -348,7 +354,25 @@ fn compile(f: &Filters, idx: &Index) -> Result<Compiled, String> {
         DatePreset::OlderThanYear => (None, ago(365)),
     };
 
-    let location = f.location.trim().replace('/', "\\").to_lowercase();
+    let normalize = |p: &str| p.trim().replace('/', "\\").to_lowercase();
+    let location = normalize(&f.location);
+
+    let mut excluded_dirs: Option<Vec<bool>> = None;
+    let mut excluded_entries = HashSet::new();
+    for path in &f.excluded {
+        let inside = location_dirs(idx, &normalize(path));
+        for (d, rec) in idx.dirs.iter().enumerate() {
+            // The excluded folder itself: inside, but its parent is not.
+            let top = inside[d] && (rec.parent == NONE || !inside[rec.parent as usize]);
+            if top && rec.entry != NONE {
+                excluded_entries.insert(rec.entry);
+            }
+        }
+        match &mut excluded_dirs {
+            Some(all) => all.iter_mut().zip(inside).for_each(|(a, b)| *a |= b),
+            None => excluded_dirs = Some(inside),
+        }
+    }
 
     Ok(Compiled {
         text,
@@ -363,6 +387,8 @@ fn compile(f: &Filters, idx: &Index) -> Result<Compiled, String> {
         location: (!location.is_empty()).then(|| location_dirs(idx, &location)),
         include_hidden: f.include_hidden,
         include_system: f.include_system,
+        excluded_dirs,
+        excluded_entries,
     })
 }
 
@@ -374,7 +400,7 @@ pub fn extension(name_lower: &str) -> &str {
 }
 
 impl Compiled {
-    fn matches(&self, idx: &Index, e: &Entry, buf: &mut String) -> bool {
+    fn matches(&self, idx: &Index, id: u32, e: &Entry, buf: &mut String) -> bool {
         if (!self.include_hidden && e.flags & F_HIDDEN != 0) || (!self.include_system && e.flags & F_SYSTEM != 0) {
             return false;
         }
@@ -401,6 +427,11 @@ impl Compiled {
         }
         if let Some(loc) = &self.location {
             if !loc[e.parent as usize] {
+                return false;
+            }
+        }
+        if let Some(ex) = &self.excluded_dirs {
+            if ex[e.parent as usize] || (is_dir && self.excluded_entries.contains(&id)) {
                 return false;
             }
         }
@@ -561,7 +592,7 @@ fn run(shared: &Shared, req: &Request, latest: &AtomicU64) -> Option<Outcome> {
             if latest.load(Ordering::Relaxed) != id {
                 return None;
             }
-            compiled.matches(&idx, &idx.entries[i as usize], buf).then_some(i)
+            compiled.matches(&idx, i, &idx.entries[i as usize], buf).then_some(i)
         })
         .flatten()
         .collect();
