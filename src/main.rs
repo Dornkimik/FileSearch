@@ -4,6 +4,7 @@
 mod app;
 mod icons;
 mod index;
+mod preview;
 mod search;
 mod theme;
 mod util;

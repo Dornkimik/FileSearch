@@ -2,7 +2,7 @@
 
 use std::f32::consts::{FRAC_1_SQRT_2, TAU};
 
-use eframe::egui::{Color32, CornerRadius, Painter, Rect, Stroke, StrokeKind, pos2, vec2};
+use eframe::egui::{Color32, CornerRadius, Painter, Pos2, Rect, Shape, Stroke, StrokeKind, pos2, vec2};
 
 pub fn magnifier(p: &Painter, rect: Rect, color: Color32) {
     let s = rect.width().min(rect.height());
@@ -44,6 +44,13 @@ pub fn moon(p: &Painter, rect: Rect, color: Color32, bg: Color32) {
     let c = rect.center();
     p.circle_filled(c, 6.5, color);
     p.circle_filled(c + vec2(3.4, -3.0), 5.6, bg);
+}
+
+/// A round "play" badge drawn over video thumbnails.
+pub fn play_badge(p: &Painter, center: Pos2) {
+    p.circle_filled(center, 24.0, Color32::from_black_alpha(150));
+    let pts = vec![center + vec2(-7.0, -11.0), center + vec2(-7.0, 11.0), center + vec2(12.0, 0.0)];
+    p.add(Shape::convex_polygon(pts, Color32::WHITE, Stroke::NONE));
 }
 
 pub fn close(p: &Painter, rect: Rect, color: Color32) {

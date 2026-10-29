@@ -4,13 +4,15 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use eframe::egui::{
-    self, Align, Button, CentralPanel, Color32, ComboBox, CursorIcon, FontId, Frame, Key, Label, Layout, Margin,
-    Modifiers, Panel, Response, RichText, ScrollArea, Sense, Stroke, TextEdit, Theme, Ui, vec2,
+    self, Align, Align2, Button, CentralPanel, Color32, ComboBox, CursorIcon, FontId, Frame, Key, Label, Layout,
+    Margin, Modifiers, Panel, Rect, Response, RichText, ScrollArea, Sense, Stroke, TextEdit, TextureHandle,
+    TextureOptions, Theme, Ui, pos2, vec2,
 };
 use egui_extras::{Column, TableBuilder};
 
 use crate::icons;
 use crate::index::{self, NONE, Shared};
+use crate::preview;
 use crate::search::{CATEGORIES, DatePreset, Filters, Kind, Mode, Request, Searcher, SizeUnit, Sort, SortKey};
 use crate::theme::{self, Palette};
 use crate::util;
@@ -49,6 +51,40 @@ pub struct App {
     controls_width: f32,
     last_len: usize,
     last_refresh: Instant,
+
+    show_preview: bool,
+    previewer: preview::Loader,
+    preview: PreviewState,
+}
+
+/// The selected result, copied out of the index for the details pane.
+struct Selection {
+    path: String,
+    name: String,
+    folder: String,
+    size: u64,
+    modified: u32,
+    is_dir: bool,
+    ext: String,
+    kind: Option<preview::Kind>,
+}
+
+#[derive(Default)]
+struct PreviewState {
+    /// Path the preview belongs to ("" when nothing is previewed).
+    path: String,
+    id: u64,
+    status: PreviewStatus,
+    started: Option<Instant>,
+}
+
+#[derive(Default)]
+enum PreviewStatus {
+    #[default]
+    Idle,
+    Loading,
+    Ready { frames: Vec<(TextureHandle, Duration)>, total: Duration, dims: Option<[u32; 2]> },
+    Failed,
 }
 
 impl App {
@@ -60,7 +96,12 @@ impl App {
         let drives = util::fixed_drives();
         let ctx = cc.egui_ctx.clone();
         index::start(shared.clone(), drives.clone(), true, move || ctx.request_repaint());
+        let ctx = cc.egui_ctx.clone();
+        let previewer = preview::Loader::new(move || ctx.request_repaint());
         Self {
+            show_preview: true,
+            previewer,
+            preview: PreviewState::default(),
             shared,
             searcher,
             drives,
@@ -240,6 +281,9 @@ impl App {
             if chip(ui, p, self.show_filters, &label).clicked() {
                 self.show_filters = !self.show_filters;
             }
+            if chip(ui, p, self.show_preview, "Preview").clicked() {
+                self.show_preview = !self.show_preview;
+            }
             let dark = ui.visuals().dark_mode;
             let theme_btn = paint_button(ui, p, |painter, r| {
                 if dark { icons::sun(painter, r, p.text) } else { icons::moon(painter, r, p.text, p.field) }
@@ -409,13 +453,14 @@ impl App {
         let mut table = TableBuilder::new(ui)
             .id_salt("results")
             .striped(false)
-            .resizable(true)
+            .resizable(false)
             .sense(Sense::click())
             .cell_layout(Layout::left_to_right(Align::Center))
-            .column(Column::initial(320.0).at_least(140.0).clip(true))
-            .column(Column::remainder().at_least(160.0).clip(true))
-            .column(Column::initial(90.0).at_least(70.0).clip(true))
-            .column(Column::initial(150.0).at_least(120.0).clip(true))
+            // Name and Folder share whatever width is left, so the table always fits beside the preview.
+            .column(Column::remainder().at_least(120.0).clip(true))
+            .column(Column::remainder().at_least(90.0).clip(true))
+            .column(Column::exact(76.0).clip(true))
+            .column(Column::exact(138.0).clip(true))
             .min_scrolled_height(0.0)
             .auto_shrink([false, false]);
         if let Some(r) = self.scroll_to.take() {
@@ -510,6 +555,178 @@ impl App {
         action
     }
 
+    fn selection(&self) -> Option<Selection> {
+        if self.results_version != self.shared.version.load(Ordering::SeqCst) {
+            return None;
+        }
+        let id = *self.results.get(self.selected?)?;
+        let idx = self.shared.index.read();
+        let e = idx.entries.get(id as usize)?;
+        let lower = idx.name_lower(e);
+        Some(Selection {
+            path: idx.full_path(e),
+            name: idx.name(e).to_string(),
+            folder: idx.dir_path(e.parent),
+            size: e.size,
+            modified: e.modified,
+            is_dir: e.is_dir(),
+            ext: crate::search::extension(lower).to_string(),
+            kind: if e.is_dir() { None } else { preview::kind(lower) },
+        })
+    }
+
+    /// Starts loading a preview when the selection changes and uploads finished ones as textures.
+    fn sync_preview(&mut self, ctx: &egui::Context, sel: Option<&Selection>) {
+        let want = sel.filter(|s| self.show_preview && s.kind.is_some());
+        let key = want.map_or("", |s| s.path.as_str());
+        if key != self.preview.path {
+            self.preview.path = key.to_string();
+            self.preview.id += 1;
+            self.preview.status = match want {
+                Some(s) => {
+                    self.previewer.request(self.preview.id, s.path.clone(), s.kind.unwrap());
+                    PreviewStatus::Loading
+                }
+                None => PreviewStatus::Idle,
+            };
+        }
+
+        let finished = self.previewer.result.lock().take();
+        if let Some((id, result)) = finished {
+            if id == self.preview.id {
+                self.preview.status = match result {
+                    Ok(decoded) => {
+                        let frames: Vec<(TextureHandle, Duration)> = decoded
+                            .frames
+                            .into_iter()
+                            .enumerate()
+                            .map(|(i, f)| (ctx.load_texture(format!("preview-{i}"), f.image, TextureOptions::LINEAR), f.delay))
+                            .collect();
+                        let total = frames.iter().map(|f| f.1).sum();
+                        PreviewStatus::Ready { frames, total, dims: decoded.dims }
+                    }
+                    Err(_) => PreviewStatus::Failed,
+                };
+                self.preview.started = Some(Instant::now());
+            }
+        }
+    }
+
+    fn preview_panel(&mut self, ui: &mut Ui, p: &Palette, sel: Option<&Selection>) -> Option<Action> {
+        let mut action = None;
+        Frame::new()
+            .fill(p.surface)
+            .stroke(Stroke::new(1.0, p.border))
+            .corner_radius(10)
+            .inner_margin(Margin::same(14))
+            .show(ui, |ui| {
+                ui.set_min_size(ui.available_size());
+                let Some(s) = sel else {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space((ui.available_height() * 0.4).max(20.0));
+                        ui.label(RichText::new("Select a file to preview it").color(p.muted));
+                    });
+                    return;
+                };
+                ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                    // Media area
+                    let w = ui.available_width();
+                    let h = (w * 0.8).clamp(160.0, 520.0);
+                    let (rect, _) = ui.allocate_exact_size(vec2(w, h), Sense::hover());
+                    ui.painter().rect_filled(rect, 8, p.field);
+                    let inner = rect.shrink(10.0);
+                    match &self.preview.status {
+                        PreviewStatus::Ready { frames, total, .. } if !frames.is_empty() => {
+                            let i = self.current_frame(ui.ctx(), frames, *total);
+                            let tex = &frames[i].0;
+                            let size = tex.size_vec2();
+                            let scale = (inner.width() / size.x).min(inner.height() / size.y).min(2.0);
+                            let img = Rect::from_center_size(rect.center(), size * scale);
+                            let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
+                            ui.painter().image(tex.id(), img, uv, Color32::WHITE);
+                            if s.kind == Some(preview::Kind::Video) {
+                                icons::play_badge(ui.painter(), rect.center());
+                            }
+                        }
+                        PreviewStatus::Loading => {
+                            ui.put(Rect::from_center_size(rect.center(), vec2(24.0, 24.0)), egui::Spinner::new().size(24.0).color(p.accent));
+                        }
+                        _ => {
+                            let label = if s.is_dir {
+                                "Folder".to_string()
+                            } else if s.kind.is_some() {
+                                "No preview available".to_string()
+                            } else if s.ext.is_empty() {
+                                "File".to_string()
+                            } else {
+                                s.ext.to_uppercase()
+                            };
+                            let big = s.kind.is_none() && !s.is_dir;
+                            let font = if big { theme::semibold(28.0) } else { FontId::proportional(14.0) };
+                            ui.painter().text(rect.center(), Align2::CENTER_CENTER, label, font, p.muted);
+                        }
+                    }
+
+                    // Details
+                    ui.add_space(14.0);
+                    ui.add(Label::new(RichText::new(&s.name).font(theme::semibold(15.5)).color(p.text)).wrap());
+                    ui.add_space(8.0);
+                    let row = |ui: &mut Ui, k: &str, v: String| {
+                        ui.label(RichText::new(k).color(p.muted));
+                        ui.label(RichText::new(v).color(p.text));
+                        ui.end_row();
+                    };
+                    egui::Grid::new("details").num_columns(2).spacing([14.0, 6.0]).show(ui, |ui| {
+                        row(ui, "Type", type_label(s));
+                        if !s.is_dir {
+                            row(ui, "Size", util::format_size(s.size));
+                        }
+                        if let PreviewStatus::Ready { frames, dims, .. } = &self.preview.status {
+                            if let Some([w, h]) = dims {
+                                row(ui, "Dimensions", format!("{w} × {h}"));
+                            }
+                            if frames.len() > 1 {
+                                row(ui, "Frames", frames.len().to_string());
+                            }
+                        }
+                        row(ui, "Modified", util::format_time(s.modified));
+                    });
+                    ui.add_space(8.0);
+                    ui.label(RichText::new("Folder").color(p.muted));
+                    ui.add(Label::new(RichText::new(&s.folder).color(p.text)).wrap());
+
+                    ui.add_space(14.0);
+                    ui.horizontal(|ui| {
+                        let half = (ui.available_width() - ui.spacing().item_spacing.x) / 2.0;
+                        if ui.add(Button::new("Open").min_size(vec2(half, 32.0))).clicked() {
+                            action = Some(Action::Open(s.path.clone()));
+                        }
+                        if ui.add(Button::new("Show in Explorer").min_size(vec2(half, 32.0))).clicked() {
+                            action = Some(Action::Reveal(s.path.clone()));
+                        }
+                    });
+                });
+            });
+        action
+    }
+
+    /// Picks the GIF frame for the current time and schedules the next repaint.
+    fn current_frame(&self, ctx: &egui::Context, frames: &[(TextureHandle, Duration)], total: Duration) -> usize {
+        if frames.len() < 2 || total.is_zero() {
+            return 0;
+        }
+        let elapsed = self.preview.started.map_or(Duration::ZERO, |t| t.elapsed());
+        let mut t = Duration::from_nanos((elapsed.as_nanos() % total.as_nanos()) as u64);
+        for (i, (_, delay)) in frames.iter().enumerate() {
+            if t < *delay {
+                ctx.request_repaint_after(*delay - t);
+                return i;
+            }
+            t -= *delay;
+        }
+        0
+    }
+
     fn status_bar(&self, ui: &mut Ui, p: &Palette, index_len: usize) {
         ui.horizontal(|ui| {
             let small = |s: String, c: Color32| RichText::new(s).size(12.5).color(c);
@@ -578,8 +795,25 @@ impl eframe::App for App {
             self.rescan(&ctx);
         }
 
+        let selection = self.selection();
+        self.sync_preview(&ctx, selection.as_ref());
+        let mut open = self.show_preview;
+        Panel::right("preview")
+            .resizable(true)
+            .default_size(340.0)
+            .size_range(260.0..=720.0)
+            .show_separator_line(false)
+            .drag_to_open(false)
+            .frame(Frame::new().fill(p.bg).inner_margin(Margin { left: 0, right: 16, top: 0, bottom: 12 }))
+            .show_collapsible(ui, &mut open, |ui| {
+                if let Some(a) = self.preview_panel(ui, &p, selection.as_ref()) {
+                    action = Some(a);
+                }
+            });
+        self.show_preview = open;
+
         CentralPanel::no_frame()
-            .frame(Frame::new().fill(p.bg).inner_margin(Margin { left: 8, right: 16, top: 0, bottom: 0 }))
+            .frame(Frame::new().fill(p.bg).inner_margin(Margin { left: 8, right: 12, top: 0, bottom: 0 }))
             .show(ui, |ui| {
                 Frame::new()
                     .fill(p.surface)
@@ -705,6 +939,22 @@ fn sort_header(ui: &mut Ui, p: &Palette, sort: &mut Sort, key: SortKey, label: &
             // Names read best A→Z; sizes and dates are most useful largest/newest first.
             *sort = Sort { key, ascending: matches!(key, SortKey::Name | SortKey::Folder) };
         }
+    }
+}
+
+fn type_label(s: &Selection) -> String {
+    if s.is_dir {
+        return "Folder".into();
+    }
+    if s.ext.is_empty() {
+        return "File".into();
+    }
+    let ext = s.ext.to_uppercase();
+    match s.kind {
+        Some(preview::Kind::Image) => format!("{ext} image"),
+        Some(preview::Kind::Gif) => "GIF animation".into(),
+        Some(preview::Kind::Video) => format!("{ext} video"),
+        None => format!("{ext} file"),
     }
 }
 
