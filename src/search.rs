@@ -149,6 +149,7 @@ pub struct Filters {
     pub modified: DatePreset,
     pub location: String,
     pub include_hidden: bool,
+    pub include_system: bool,
 }
 
 impl Filters {
@@ -211,6 +212,7 @@ struct Compiled {
     /// Per directory: whether it lies inside the location filter.
     location: Option<Vec<bool>>,
     include_hidden: bool,
+    include_system: bool,
 }
 
 fn parse_size(s: &str, unit: SizeUnit, which: &str) -> Result<Option<u64>, String> {
@@ -360,6 +362,7 @@ fn compile(f: &Filters, idx: &Index) -> Result<Compiled, String> {
         before,
         location: (!location.is_empty()).then(|| location_dirs(idx, &location)),
         include_hidden: f.include_hidden,
+        include_system: f.include_system,
     })
 }
 
@@ -372,7 +375,7 @@ pub fn extension(name_lower: &str) -> &str {
 
 impl Compiled {
     fn matches(&self, idx: &Index, e: &Entry, buf: &mut String) -> bool {
-        if !self.include_hidden && e.flags & (F_HIDDEN | F_SYSTEM) != 0 {
+        if (!self.include_hidden && e.flags & F_HIDDEN != 0) || (!self.include_system && e.flags & F_SYSTEM != 0) {
             return false;
         }
         let is_dir = e.is_dir();

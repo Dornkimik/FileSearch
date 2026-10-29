@@ -320,9 +320,12 @@ impl App {
             });
 
             section(ui, p, "OPTIONS");
-            ui.checkbox(&mut f.include_hidden, "Include hidden & system items");
+            ui.checkbox(&mut f.include_system, "Include system files").on_hover_text(
+                "Windows, Program Files, ProgramData, AppData and items marked as system files",
+            );
+            ui.checkbox(&mut f.include_hidden, "Include hidden items");
 
-            if f.active_count() > 0 || f.include_hidden {
+            if f.active_count() > 0 || f.include_hidden || f.include_system {
                 ui.add_space(14.0);
                 if ui.add(Button::new("Reset filters").min_size(vec2(full, 30.0))).clicked() {
                     let keep = (f.text.clone(), f.mode, f.case_sensitive, f.match_path);

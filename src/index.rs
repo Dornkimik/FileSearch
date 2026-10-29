@@ -31,6 +31,33 @@ const ATTR_REPARSE_POINT: u32 = 0x400;
 /// Folders that are never worth descending into.
 const SKIP_DIRS: &[&str] = &["$recycle.bin", "system volume information", "$winreagent"];
 
+/// Top-level folders that belong to Windows or installed programs rather than the user.
+const SYSTEM_ROOT_DIRS: &[&str] = &[
+    "windows",
+    "windows.old",
+    "program files",
+    "program files (x86)",
+    "programdata",
+    "perflogs",
+    "recovery",
+    "msocache",
+    "intel",
+    "amd",
+    "nvidia",
+    "drivers",
+    "onedrivetemp",
+    "$windows.~bt",
+    "$windows.~ws",
+    "$sysreset",
+    "$getcurrent",
+];
+
+/// Whether a folder counts as a system location; everything inside it is treated as system too.
+fn is_system_dir(lower: &str, at_root: bool) -> bool {
+    // Per-user application data (C:\Users\<name>\AppData) is system territory wherever it lives.
+    lower == "appdata" || (at_root && SYSTEM_ROOT_DIRS.contains(&lower))
+}
+
 #[derive(Clone, Copy)]
 pub struct Entry {
     pub name_off: u32,
@@ -251,8 +278,10 @@ fn filetime_to_unix(ft: u64) -> u32 {
     ((ft / 10_000_000) as i64 - 11_644_473_600).clamp(0, u32::MAX as i64) as u32
 }
 
-fn scan_dir<'s>(scope: &rayon::Scope<'s>, ctx: &'s ScanCtx, path: PathBuf, dir: u32, parent: u32, hidden_parent: bool) {
+/// `inherited` holds the hidden/system flags of the folder being listed, which its contents inherit.
+fn scan_dir<'s>(scope: &rayon::Scope<'s>, ctx: &'s ScanCtx, path: PathBuf, dir: u32, parent: u32, inherited: u8) {
     let Ok(read) = fs::read_dir(&path) else { return };
+    let at_root = parent == NONE;
     let mut entries = Vec::new();
     for item in read.flatten() {
         // On Windows this metadata comes straight from FindNextFile: no extra syscall.
@@ -261,14 +290,14 @@ fn scan_dir<'s>(scope: &rayon::Scope<'s>, ctx: &'s ScanCtx, path: PathBuf, dir: 
         let name = item.file_name().to_string_lossy().into_owned();
         let lower = name.to_lowercase();
         let is_dir = meta.is_dir();
-        let mut flags = 0u8;
+        let mut flags = inherited;
         if is_dir {
             flags |= F_DIR;
         }
-        if hidden_parent || attrs & ATTR_HIDDEN != 0 {
+        if attrs & ATTR_HIDDEN != 0 {
             flags |= F_HIDDEN;
         }
-        if attrs & ATTR_SYSTEM != 0 {
+        if attrs & ATTR_SYSTEM != 0 || (is_dir && is_system_dir(&lower, at_root)) {
             flags |= F_SYSTEM;
         }
         let mut dir_id = NONE;
@@ -276,8 +305,8 @@ fn scan_dir<'s>(scope: &rayon::Scope<'s>, ctx: &'s ScanCtx, path: PathBuf, dir: 
         if is_dir && attrs & ATTR_REPARSE_POINT == 0 && !SKIP_DIRS.contains(&lower.as_str()) {
             dir_id = ctx.next_dir.fetch_add(1, Ordering::Relaxed);
             let sub = item.path();
-            let hidden = flags & F_HIDDEN != 0;
-            scope.spawn(move |s| scan_dir(s, ctx, sub, dir_id, dir, hidden));
+            let inherit = flags & (F_HIDDEN | F_SYSTEM);
+            scope.spawn(move |s| scan_dir(s, ctx, sub, dir_id, dir, inherit));
         }
         entries.push(RawEntry {
             lower: (lower != name).then_some(lower),
@@ -327,7 +356,7 @@ fn scan_roots(roots: &[PathBuf], shared: &Arc<Shared>, apply: impl FnMut(&mut dy
             for (i, root) in roots.iter().enumerate() {
                 let root = root.clone();
                 let ctx = &ctx;
-                scope.spawn(move |s| scan_dir(s, ctx, root, i as u32, NONE, false));
+                scope.spawn(move |s| scan_dir(s, ctx, root, i as u32, NONE, 0));
             }
         });
         // Closes the channel so the collector finishes.
@@ -395,7 +424,7 @@ pub fn start(shared: Arc<Shared>, roots: Vec<PathBuf>, use_cache: bool, repaint:
 // ---------------------------------------------------------------------------
 // On-disk cache: a flat little-endian dump of the arenas and records.
 
-const MAGIC: &[u8; 8] = b"FSIDX\x00\x00\x02";
+const MAGIC: &[u8; 8] = b"FSIDX\x00\x00\x03";
 
 pub fn cache_path() -> Option<PathBuf> {
     let base = std::env::var_os("LOCALAPPDATA")?;
